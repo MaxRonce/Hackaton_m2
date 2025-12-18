@@ -6,15 +6,13 @@ This repository contains an adapted Machine Learning pipeline designed for a spa
 - **Advanced EDA**: Automated sparsity and metadata-driven analysis.
 - **Robust Preprocessing**: Handles high missingness (>95%) with specific indicators and categorical encoding.
 - **Optimization**: Integrated Optuna support for hyperparameter tuning.
-- **Strict Inference**: Ensures alignment with submission requirements (full dataset prediction).
-- **Fast Iteration**: Subsampling support for quick debugging.
 
 ## Setup
 Ensure you have the required dependencies installed:
 ```bash
 pip install -r requirements.txt
 ```
-*(If `requirements.txt` is missing, install: `pandas numpy scikit-learn lightgbm xgboost optuna seaborn matplotlib`)*
+
 
 ## Usage
 

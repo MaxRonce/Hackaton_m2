@@ -301,9 +301,39 @@ def explain(args):
     
     # Get feature names if possible
     feature_names = None
-    if hasattr(pipeline.pipeline, "get_feature_names_out"):
-        feature_names = pipeline.pipeline.get_feature_names_out()
+    try:
+        if hasattr(pipeline, "preprocessor"):
+             feature_names = list(pipeline.preprocessor.get_feature_names_out())
+        elif hasattr(pipeline.pipeline, "get_feature_names_out"):
+            feature_names = list(pipeline.pipeline.get_feature_names_out())
+    except:
+        pass
     
+    if feature_names is not None:
+        # Load metadata for descriptive labels
+        try:
+            metadata_path = Path(args.data_path).parent / "features_metadata.csv"
+            if not metadata_path.exists():
+                metadata_path = DATA_DIR / "features_metadata.csv"
+            
+            if metadata_path.exists():
+                meta = pd.read_csv(metadata_path)
+                meta_dict = meta.set_index('index')['SAS'].to_dict()
+                
+                new_names = []
+                for f in feature_names:
+                    clean_f = f.split("__")[-1]
+                    is_missing = "missingindicator_" in f.lower() or "missing_" in f.lower()
+                    base_f = clean_f.replace("missingindicator_", "").replace("missing_", "")
+                    
+                    label = meta_dict.get(base_f, base_f)
+                    if is_missing:
+                        label = f"Missing: {label}"
+                    new_names.append(label)
+                feature_names = new_names
+        except Exception as e:
+            logger.warning(f"Failed to map descriptive feature names: {e}")
+
     # Run SHAP
     run_shap_analysis(model, X_train, X_test, OUTPUTS_DIR / "explanation", feature_names=feature_names)
 

@@ -20,8 +20,8 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
     """
     
     def __init__(self, 
-                 max_missing_rate: float = 0.95, 
-                 variance_threshold: float = 0.0,
+                 max_missing_rate: float = 0.80, 
+                 variance_threshold: float = 0.1,
                  min_samples_per_class: int = 5,
                  output_report_path: Optional[Union[str, Path]] = None):
         self.max_missing_rate = max_missing_rate
@@ -38,40 +38,50 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         """
         logger.info("Fitting FeatureSelector...")
         n_rows, n_cols = X.shape
-        self.dropped_features_ = {
-            "missing_rate": [],
-            "low_variance": [],
-            "low_samples_per_class": []
-        }
+        self.dropped_details_ = [] # List of dicts: {feature, reason, value}
         
         # 1. Missing Rate
         missing_rate = X.isnull().mean()
-        drop_missing = missing_rate[missing_rate > self.max_missing_rate].index.tolist()
-        self.dropped_features_["missing_rate"] = drop_missing
+        drop_missing = missing_rate[missing_rate > self.max_missing_rate]
+        for feat, val in drop_missing.items():
+            self.dropped_details_.append({
+                "feature": feat,
+                "reason": "missing_rate",
+                "value": float(val),
+                "threshold": self.max_missing_rate
+            })
         logger.info(f"Found {len(drop_missing)} features with > {self.max_missing_rate:.1%} missing values.")
         
-        # Features to check for variance (exclude already droppped)
-        remaining_cols = [c for c in X.columns if c not in drop_missing]
+        # Features to check for variance (exclude already dropped)
+        remaining_cols = [c for c in X.columns if c not in [d['feature'] for d in self.dropped_details_]]
         
         # 2. Variance (Near Zero)
-        # Note: Variance calculation ignores NaNs by default in pandas
         variances = X[remaining_cols].var()
-        drop_variance = variances[variances <= self.variance_threshold].index.tolist()
-        
-        # Also check for single unique value (if not caught by var=0, e.g. due to all NaNs except 1 value?)
-        # Actually pd.var() of single value is NaN. pd.var() of constant is 0.
-        # Let's also check for columns with only 1 unique value observed (ignoring NaNs)
-        # explicitly as "low information"
+        drop_variance = variances[variances <= self.variance_threshold]
+        for feat, val in drop_variance.items():
+             self.dropped_details_.append({
+                "feature": feat,
+                "reason": "low_variance",
+                "value": float(val) if not np.isnan(val) else 0.0,
+                "threshold": self.variance_threshold
+            })
+                
+        # Also check for single unique value
+        already_dropped = [d['feature'] for d in self.dropped_details_]
         for col in remaining_cols:
-            if col in drop_variance:
+            if col in already_dropped:
                 continue
             if X[col].nunique(dropna=True) <= 1:
-                drop_variance.append(col)
+                self.dropped_details_.append({
+                    "feature": col,
+                    "reason": "constant_value",
+                    "value": 1,
+                    "threshold": 1
+                })
                 
-        self.dropped_features_["low_variance"] = list(set(drop_variance))
-        logger.info(f"Found {len(self.dropped_features_['low_variance'])} features with low variance.")
+        logger.info(f"Found {len(self.dropped_details_) - len(drop_missing)} additional low variance/constant features.")
         
-        remaining_cols = [c for c in remaining_cols if c not in self.dropped_features_["low_variance"]]
+        remaining_cols = [c for c in X.columns if c not in [d['feature'] for d in self.dropped_details_]]
         
         # 3. Low samples per class (if y provided)
         if y is not None:
@@ -91,22 +101,25 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
             for col in remaining_cols:
                 mask_not_null = X[col].notna()
                 valid = True
+                min_count = float('inf')
                 for label in classes:
                     count = (mask_not_null & (y == label)).sum()
+                    min_count = min(min_count, count)
                     if count < self.min_samples_per_class:
                         valid = False
                         break
                 if not valid:
-                    drop_class_sparsity.append(col)
+                    self.dropped_details_.append({
+                        "feature": col,
+                        "reason": "low_samples_per_class",
+                        "value": int(min_count),
+                        "threshold": self.min_samples_per_class
+                    })
             
-            self.dropped_features_["low_samples_per_class"] = drop_class_sparsity
-            logger.info(f"Found {len(drop_class_sparsity)} features with low samples per class.")
+            logger.info("Checked class-specific sparsity.")
             
         # Compile selected
-        all_dropped = set(self.dropped_features_["missing_rate"] + 
-                          self.dropped_features_["low_variance"] + 
-                          self.dropped_features_["low_samples_per_class"])
-        
+        all_dropped = {d['feature'] for d in self.dropped_details_}
         self.selected_features_ = [c for c in X.columns if c not in all_dropped]
         logger.info(f"Feature Selection complete. Dropped {len(all_dropped)} features. Kept {len(self.selected_features_)}.")
         
@@ -137,7 +150,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
             "n_total_features": n_total,
             "n_dropped_features": n_dropped,
             "n_kept_features": len(self.selected_features_),
-            "details": self.dropped_features_
+            "dropped_details": self.dropped_details_
         }
         
         path = Path(self.output_report_path)

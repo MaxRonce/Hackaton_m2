@@ -89,20 +89,12 @@ def run_inference(data_path: str, model_path: str, pipeline_path: str, selector_
     # Apply Threshold
     preds_label = (preds_proba >= best_thresh).astype(int)
     
-    # 6. Save
-    # "Output file must contain exactly one column of predictions"
-    # Does "one column" mean just values 0/1/0? Or ID, Prediction?
-    # Prompt: "Output file must contain exactly one column of predictions"
-    # Prompt: "Include strict checks: Row count, Index alignment"
-    # If strict ordering is required, just the column of predictions is often requested to paste/upload.
-    # I will save as single column with header "y" per target config? Or headerless?
-    # "Output file must contain exactly one column of predictions" -> Sounds like NO ID column.
-    # I will verify this interpreting.
-    
     submission = pd.DataFrame(preds_label, columns=[TARGET_COLUMN]) # Using config target name 'y'
     
     # Write to CSV
     submission.to_csv(output_path, index=False)
+
+    # Edit the 1st row of
     
     print(f"Predictions saved to {output_path} with threshold {best_thresh:.4f}")
 

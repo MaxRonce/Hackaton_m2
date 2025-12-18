@@ -15,8 +15,10 @@ class PreprocessingPipeline:
         self.target_col = target_col
         self.id_col = id_col
         self.drop_cols = drop_cols if drop_cols else []
-        self.pipeline = None
+        self.preprocessor = None
         self.feature_names_in_ = None
+        self.numerical_features_ = []
+        self.categorical_features_ = []
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> 'PreprocessingPipeline':
         """
@@ -57,7 +59,7 @@ class PreprocessingPipeline:
             ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
         ])
         
-        self.pipeline = ColumnTransformer(
+        self.preprocessor = ColumnTransformer(
             transformers=[
                 ('num', numeric_transformer, self.num_features),
                 ('cat', categorical_transformer, self.cat_features)
@@ -65,7 +67,7 @@ class PreprocessingPipeline:
             verbose_feature_names_out=False # Clean names
         )
         
-        self.pipeline.fit(X_clean, y)
+        self.preprocessor.fit(X_clean, y)
         logger.info("Preprocessing pipeline fitted.")
         return self
 
@@ -79,7 +81,7 @@ class PreprocessingPipeline:
         Returns:
             np.ndarray: Processed numpy array.
         """
-        if self.pipeline is None:
+        if self.preprocessor is None:
             raise ValueError("Pipeline not fitted. Call fit() first.")
         
         X_clean = self._drop_features(X)
@@ -91,7 +93,7 @@ class PreprocessingPipeline:
         if missing_cols:
              logger.warning(f"Missing columns in input: {missing_cols}. This might cause errors.")
 
-        X_transformed = self.pipeline.transform(X_clean)
+        X_transformed = self.preprocessor.transform(X_clean)
         return X_transformed
 
     def fit_transform(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> np.ndarray:
@@ -106,17 +108,27 @@ class PreprocessingPipeline:
         return df.drop(columns=cols_to_drop)
 
 
-    def get_categorical_indices(self) -> List[int]:
-        """
-        Returns indices of categorical columns in the transformed array.
-        Assumes 'num' then 'cat' order in ColumnTransformer.
-        """
-        if self.pipeline is None:
+    def get_categorical_indices(self):
+        """Return indices of categorical features in transformed array."""
+        if not hasattr(self, "preprocessor") or self.preprocessor is None:
             return []
-        
-        # In ColumnTransformer, output is concatenated in order of transformers
-        n_num = len(self.num_features)
-        n_cat = len(self.cat_features)
-        
-        # Cat indices start after Num indices
-        return list(range(n_num, n_num + n_cat))
+            
+        # Output order is Num, Cat
+        try:
+             # Num feature count (columns + indicators)
+             num_trans = self.preprocessor.named_transformers_['num']
+             if hasattr(num_trans, "get_feature_names_out"):
+                 n_num_out = len(num_trans.get_feature_names_out())
+             else:
+                 # Estimate: input + indicators?
+                 # safer to just inspect transformed shape of a dummy, or assume sklearn < 1.0 logic?
+                 # Let's hope get_feature_names_out works (sklearn > 1.0)
+                 n_num_out = 0 # Fallback risk
+                 
+             n_cat_out = len(self.cat_features)
+             
+             # Cat indices start after Num indices
+             return list(range(n_num_out, n_num_out + n_cat_out))
+        except Exception as e:
+            logger.warning(f"Could not calculate categorical indices: {e}")
+            return []

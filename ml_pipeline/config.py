@@ -5,7 +5,7 @@ from pathlib import Path
 SEED = 42
 
 # -- Export configuration --
-GROUP_TOKEN = 42
+GROUP_TOKEN = 370
 
 # --- Paths ---
 PROJECT_ROOT = Path(__file__).parent.parent

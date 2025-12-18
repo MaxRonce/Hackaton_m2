@@ -4,194 +4,254 @@ import numpy as np
 import sys
 import shap
 import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent))
 
-from ml_pipeline.config import MODELS_DIR, DATA_DIR, TARGET_COLUMN
+from ml_pipeline.config import MODELS_DIR, DATA_DIR, TARGET_COLUMN, ID_COLUMN
 from ml_pipeline.utils.io import load_pickle
 from ml_pipeline.data.loader import load_data
-from ml_pipeline.models.base import BaseModel
-from ml_pipeline.models.ensemble import SoftVotingEnsemble, load_models_from_paths
 
-st.set_page_config(page_title="Hackaton Machine Learning Pipeline", layout="wide")
+# Page Config
+st.set_page_config(page_title="Medical Profiler - Mortality Prediction", layout="wide", page_icon="🏥")
 
-st.title("Hackaton Machine Learning Pipeline")
+# Styles
+st.markdown("""
+<style>
+    .big-font { font-size:24px !important; }
+    .risk-high { color: #d32f2f; font-weight: bold; }
+    .risk-low { color: #388e3c; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
 
-tabs = st.tabs(["📊 EDA", "🧠 Inference", "⚙️ Model Info"])
+st.title("🏥 Medical Mortality Risk Profiler")
+
+# --- Load Assets ---
+@st.cache_resource
+def load_assets():
+    model_wrapper = load_pickle(MODELS_DIR / "gbm_model.pkl")
+    pipeline = load_pickle(MODELS_DIR / "preprocessing_pipeline.pkl")
+    selector = load_pickle(MODELS_DIR / "feature_selector.pkl")
+    return model_wrapper, pipeline, selector
 
 @st.cache_data
-def load_data_cached(path):
-    return load_data(path)
-
-with tabs[0]:
-    st.header("Exploratory Data Analysis")
-    uploaded_file = st.file_uploader("Upload CSV for Analysis", type="csv")
+def load_dataset():
+    # Load Main Data
+    df = load_data(DATA_DIR / "data.csv")
+    if ID_COLUMN in df.columns:
+        df = df.set_index(ID_COLUMN)
     
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.write("### Data Preview")
-        st.dataframe(df.head())
+    # Load Metadata
+    try:
+        meta = pd.read_csv(DATA_DIR / "features_metadata.csv")
+        # 'index' is the code (e.g. AGQ130), 'SAS' is the descriptive label
+        meta_dict = meta.set_index('index')['SAS'].to_dict()
+    except Exception as e:
+        st.warning(f"Metadata not found or invalid: {e}")
+        meta_dict = {}
         
-        st.write("### Statistics")
-        st.write(df.describe())
-        
-        st.write("### Distributions")
-        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-        if numeric_cols:
-            selected_col = st.selectbox("Select Numeric Column", numeric_cols)
-            
-            if selected_col:
-                fig, ax = plt.subplots()
-                sns.histplot(df[selected_col], kde=True, ax=ax)
-                st.pyplot(fig)
-            
-        categorical_cols = df.select_dtypes(include='object').columns.tolist()
-        if categorical_cols:
-            selected_cat = st.selectbox("Select Categorical Column", categorical_cols)
-            
-            if selected_cat:
-                fig, ax = plt.subplots()
-                sns.countplot(x=selected_cat, data=df, ax=ax)
-                st.pyplot(fig)
+    return df, meta_dict
 
-with tabs[1]:
-    st.header("Real-time Inference")
+try:
+    model_wrapper, pipeline, selector = load_assets()
+    df, meta_dict = load_dataset()
+except Exception as e:
+    st.error(f"Error loading assets: {e}")
+    st.stop()
+
+
+# --- Sidebar: Patient Selection ---
+st.sidebar.header("👤 Patient Selection")
+patient_id = st.sidebar.selectbox("Select Patient Event (SEQN)", df.index.unique())
+
+if st.sidebar.button("🎲 Random Patient"):
+    patient_id = np.random.choice(df.index)
+    st.experimental_rerun()
+
+# Get Patient Data
+patient_row = df.loc[[patient_id]].copy() # Keep as DF
+true_label = patient_row[TARGET_COLUMN].values[0] if TARGET_COLUMN in patient_row.columns else None
+if TARGET_COLUMN in patient_row.columns:
+    patient_row = patient_row.drop(columns=[TARGET_COLUMN])
+
+# --- Main Logic ---
+
+# 1. Transform Data (Original)
+try:
+    X_sel = selector.transform(patient_row)
+    X_proc = pipeline.transform(X_sel)
     
-    # Load available models
-    model_files = list(MODELS_DIR.glob("*_model.pkl"))
-    model_names = [f.name for f in model_files]
-    model_names.append("Ensemble (All Models)")
+    # Predict
+    prob = model_wrapper.predict_proba(X_proc)[0, 1]
+except Exception as e:
+    st.error(f"Processing failed: {e}")
+    st.stop()
+
+# --- Layout ---
+col_pred, col_explain = st.columns([1, 2])
+
+with col_pred:
+    st.subheader("Risk Assessment")
     
-    if not model_files:
-        st.warning("No trained models found in outputs/models/. Please train a model first (e.g., `python ml_pipeline/main.py train ...`).")
+    # Gauge / Metric
+    delta_color = "inverse" if prob > 0.5 else "normal"
+    st.metric("Mortality Risk Probability", f"{prob:.2%}", delta=None)
+    
+    if prob > 0.36: # Using optimized threshold
+        st.markdown(f"<p class='big-font risk-high'>⚠️ HIGH RISK</p>", unsafe_allow_html=True)
     else:
-        selected_model_name = st.selectbox("Select Model", model_names)
+        st.markdown(f"<p class='big-font risk-low'>✅ LOW RISK</p>", unsafe_allow_html=True)
         
-        # Inputs
-        col1, col2 = st.columns(2)
-        with col1:
-            pclass = st.selectbox("Pclass", [1, 2, 3])
-            sex = st.selectbox("Sex", ["male", "female"])
-            age = st.number_input("Age", 0, 100, 30)
-            sibsp = st.number_input("Siblings/Spouses", 0, 10, 0)
-        
-        with col2:
-            parch = st.number_input("Parents/Children", 0, 10, 0)
-            fare = st.number_input("Fare", 0.0, 500.0, 32.0)
-            embarked = st.selectbox("Embarked", ["S", "C", "Q"])
-            
-        # Create DataFrame
-        input_data = pd.DataFrame({
-            "passengerid": [9999], # Dummy
-            "pclass": [pclass],
-            "name": ["Unknown"],
-            "sex": [sex],
-            "age": [age],
-            "sibsp": [sibsp],
-            "parch": [parch],
-            "ticket": ["XXXX"],
-            "fare": [fare],
-            "cabin": [np.nan],
-            "embarked": [embarked]
-        })
-        
-        if st.button("Predict Survival Probability"):
+    if true_label is not None:
+        st.info(f"Actual Outcome: {'† Deceased' if true_label==1 else 'Survived'}")
+
+    st.write("---")
+    st.write("### 🎛️ Simulation / What-If")
+    st.caption("Modify top risk factors to see impact.")
+    
+    # Identify Top Features for this patient using SHAP
+    # We need the Explainer. TreeExplainer is fast.
+    explainer = shap.TreeExplainer(model_wrapper.model)
+    shap_values = explainer.shap_values(X_proc)
+    if isinstance(shap_values, list):
+         shap_values = shap_values[1]
+    
+    # Get feature names
+    def get_feature_names(pipeline):
+        try:
+            return pipeline.preprocessor.get_feature_names_out()
+        except Exception as e:
+            # Fallback Reconstruction if get_feature_names_out fails
             try:
-                pipeline_path = MODELS_DIR / "preprocessing_pipeline.pkl"
-                pipeline = load_pickle(pipeline_path)
+                num_cols = pipeline.num_features # Using attributes from preprocessing.py
+                cat_cols = pipeline.cat_features
                 
-                # Preprocess
-                # Note: Pipeline expects standard columns. We constructed them above.
-                X_transformed = pipeline.transform(input_data)
-                
-                # Load Model(s)
-                model = None
-                if selected_model_name == "Ensemble (All Models)":
-                     # Load all available models
-                     paths = [str(p) for p in MODELS_DIR.glob("*_model.pkl")]
-                     model = load_models_from_paths(paths)
-                     st.info(f"Ensembling {len(paths)} models: {[Path(p).name for p in paths]}")
-                else:
-                    model_path = MODELS_DIR / selected_model_name
-                    model = load_pickle(model_path)
-                
-                # Predict
-                prob = model.predict_proba(X_transformed)
-                if prob.ndim == 2:
-                    prob = prob[0, 1]
-                elif prob.ndim == 1:
-                    prob = prob[0]
-                
-                st.success(f"Survival Probability: **{prob:.4f}**")
-                
-                if prob > 0.5:
-                    st.write("🎉 Likely to Survive")
-                else:
-                    st.write("💀 Unlikely to Survive")
-
-                # SHAP Explanation (Only for single models roughly, Ensemble is hard)
-                if selected_model_name != "Ensemble (All Models)":
-                    st.subheader("Why this prediction?")
-                    with st.spinner("Calculating SHAP values..."):
-                        # We need the inner model
-                        inner_model = model.model
-                        
-                        explainer = None
-                        if hasattr(inner_model, "feature_importances_"): 
-                             explainer = shap.TreeExplainer(inner_model)
-                        elif hasattr(inner_model, "coef_"):
-                             # Linear models might need background data for some plots or be simpler
-                             # For simplicity let's skip linear SHAP in app or handle differently
-                             st.warning("SHAP explanation supported best for Tree models (RF, GBM) in this app.")
-                             explainer = None
-                        
-                        if explainer:
-                            shap_values = explainer.shap_values(X_transformed)
-                            if isinstance(shap_values, list):
-                                shap_values = shap_values[1]
-                                
-                            # Force Plot
-                            st.write("Force Plot")
-                            # We use matplotlib to render
-                            shap.initjs()
-                            
-                            # Waterfall is often better for single instance
-                            try:
-                                fig, ax = plt.subplots(figsize=(10, 5))
-                                # shap.waterfall_plot expects Explanation object usually for new shap versions
-                                # or shap_values[0] if array.
-                                # Let's create an Explanation object to be safe with modern shap
-                                explanation = shap.Explanation(shap_values[0], base_values=explainer.expected_value[1] if isinstance(explainer.expected_value, list) else explainer.expected_value, data=X_transformed[0], feature_names=pipeline.pipeline.get_feature_names_out())
-                                shap.plots.waterfall(explanation, show=False)
-                                st.pyplot(plt.gcf())
-                            except Exception as e:
-                                st.warning(f"Could not render Waterfall plot: {e}")
-                                # Fallback
-                                st.write("Feature Values for this instance:")
-                                st.write(pd.DataFrame(X_transformed, columns=pipeline.pipeline.get_feature_names_out()).T)
-
+                # Indicators
+                indicators = []
+                try:
+                    imputer = pipeline.preprocessor.named_transformers_['num'].named_steps['imputer']
+                    if hasattr(imputer, 'indicator_') and imputer.indicator_ is not None:
+                        ind_features = imputer.indicator_.get_feature_names_out(num_cols)
+                        indicators = list(ind_features)
+                except:
+                    pass
                     
-            except Exception as e:
-                st.error(f"Prediction failed: {e}")
-                import traceback
-                st.text(traceback.format_exc())
+                reconstructed = num_cols + indicators + cat_cols
+                return reconstructed
+            except:
+                return [f"feat_{i}" for i in range(X_proc.shape[1])]
 
-with tabs[2]:
-    st.header("Model Performance")
-    # Load metrics jsons
-    metric_files = list(Path("outputs").glob("*_metrics.json"))
-    if metric_files:
-        for f in metric_files:
-            import json
-            with open(f) as json_file:
-                metrics = json.load(json_file)
-            st.write(f"**{f.name}**")
-            st.json(metrics)
+    feat_names = get_feature_names(pipeline)
+    
+    # Ensure dimensions match
+    if len(feat_names) != X_proc.shape[1]:
+        # Truncate or Pad
+        if len(feat_names) > X_proc.shape[1]:
+            feat_names = feat_names[:X_proc.shape[1]]
+        else:
+            feat_names += [f"feat_{i}" for i in range(len(feat_names), X_proc.shape[1])]
+
+    # Create DF of features, values, shap, description
+    # shap_values[0] is array of shape (n_features,)
+    impact_df = pd.DataFrame({
+        "feature": feat_names,
+        "value": X_proc[0],
+        # Check SHAP shape. 
+        # If binary classification, shap_values might be (n_samples, n_features) or list.
+        # We handled list above.
+        "shap": shap_values[0] if shap_values.ndim > 1 else shap_values, # handle single sample array
+        "abs_shap": np.abs(shap_values[0] if shap_values.ndim > 1 else shap_values)
+    }).sort_values(by="abs_shap", ascending=False).head(10) # Top 10 drivers
+    
+    # Simulation Inputs
+    simulated_row = patient_row.copy()
+    
+    st.markdown("##### 🔧 Adjust Key Risk Factors")
+    
+    for idx, row in impact_df.iterrows():
+        feat_name = row['feature']
+        
+        # Clean feature name
+        # Remove sklearn prefixes if present (e.g., 'num__', 'remainder__')
+        raw_feat = feat_name.split("__")[-1] 
+        # Check for our manual reconstruction prefixes
+        if raw_feat.startswith("missing_"):
+             continue # Skip editing missing indicators directly
+             
+        # Metadata description
+        desc = meta_dict.get(raw_feat, "")
+        
+        # Check if this feature exists in original raw DF
+        if raw_feat in patient_row.columns:
+            # Input Type
+            curr_val = patient_row[raw_feat].values[0]
             
-    # Show comparison plot if exists
-    comparison_plot = Path("outputs/models/optimization_comparison.png")
-    if comparison_plot.exists():
-        st.image(str(comparison_plot), caption="Optimization Comparison")
+            # Numeric or Cat?
+            if pd.api.types.is_numeric_dtype(patient_row[raw_feat]):
+                col_a, col_b = st.columns([1, 2])
+                with col_a:
+                     st.write(f"**{raw_feat}**")
+                     if desc: st.caption(desc)
+                with col_b:
+                    new_val = st.number_input(
+                        f"Value for {raw_feat}", 
+                        value=float(curr_val) if not pd.isna(curr_val) else 0.0,
+                        label_visibility="collapsed",
+                        key=f"sim_{raw_feat}"
+                    )
+                simulated_row[raw_feat] = new_val
+            else:
+                 # Try to show selectbox if few unique values?
+                 st.text(f"{raw_feat}: {curr_val}")
+
+    
+    # Re-predict Button
+    if st.button("🔄 Recalculate Risk"):
+        sim_X_sel = selector.transform(simulated_row)
+        sim_X_proc = pipeline.transform(sim_X_sel)
+        sim_prob = model_wrapper.predict_proba(sim_X_proc)[0, 1]
+        
+        diff = sim_prob - prob
+        st.metric("New Probability", f"{sim_prob:.2%}", delta=f"{diff:+.2%}", delta_color="inverse")
+
+
+with col_explain:
+    st.subheader("🔍 Explainability (SHAP)")
+    
+    # Waterfall Plot
+    shap.initjs()
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Map feature names to descriptive labels for the plot
+    display_feat_names = []
+    for f in feat_names:
+        # Clean prefix (num__, cat__, etc.)
+        clean_f = f.split("__")[-1]
+        # Check if it's a missing indicator
+        is_missing = "missingindicator_" in f.lower() or "missing_" in f.lower()
+        
+        # Get base variable name
+        base_f = clean_f.replace("missingindicator_", "").replace("missing_", "")
+        
+        label = meta_dict.get(base_f, base_f)
+        if is_missing:
+            label = f"Missing: {label}"
+        display_feat_names.append(label)
+
+    # Create Explanation object
+    explanation = shap.Explanation(
+        values=shap_values[0], 
+        base_values=explainer.expected_value[1] if isinstance(explainer.expected_value, list) else explainer.expected_value, 
+        data=X_proc[0], 
+        feature_names=display_feat_names
+    )
+    shap.plots.waterfall(explanation, max_display=15, show=False)
+    st.pyplot(fig)
+    
+    st.info("The Waterfall plot shows how each feature contributes to pushing the risk higher (Red) or lower (Blue) from the average.")
+
+# --- Metadata Explorer ---
+st.write("---")
+with st.expander("📖 Data Dictionary"):
+    st.dataframe(pd.DataFrame.from_dict(meta_dict, orient='index', columns=['Description']))
