@@ -4,7 +4,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from ..utils.logger import setup_logger
 from ..config import ID_COLUMN, TARGET_COLUMN, DROP_COLUMNS
 
@@ -107,6 +107,32 @@ class PreprocessingPipeline:
             
         return df.drop(columns=cols_to_drop)
 
+    def get_component_feature_indices(self, metadata: pd.DataFrame) -> Dict[str, List[int]]:
+        """
+        Maps metadata components to indices in the transformed output.
+        """
+        if not hasattr(self, "preprocessor") or self.preprocessor is None:
+            return {}
+            
+        feat_names = self.preprocessor.get_feature_names_out()
+        component_map = {}
+        
+        # Build base mapping from metadata
+        meta_mapping = metadata.set_index('index')['Component'].to_dict()
+        
+        for i, full_name in enumerate(feat_names):
+            # Strip prefixes added by ColumnTransformer (num__, cat__, missingindicator__)
+            base_name = full_name
+            for prefix in ['num__', 'cat__', 'missingindicator__']:
+                if base_name.startswith(prefix):
+                    base_name = base_name[len(prefix):]
+            
+            comp = meta_mapping.get(base_name, "Unknown")
+            if comp not in component_map:
+                component_map[comp] = []
+            component_map[comp].append(i)
+            
+        return component_map
 
     def get_categorical_indices(self):
         """Return indices of categorical features in transformed array."""

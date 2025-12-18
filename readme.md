@@ -1,65 +1,69 @@
 # Medical Mortality Prediction Pipeline (Hackathon M2)
 
-This repository contains an adapted Machine Learning pipeline designed for a sparse medical dataset (~59k rows, ~1.5k features). It is optimized for F1-score and utilizes LightGBM/XGBoost with robust preprocessing for handling missing data.
+Results by Maxime RONCERAY 
 
-## Features
-- **Advanced EDA**: Automated sparsity and metadata-driven analysis.
-- **Robust Preprocessing**: Handles high missingness (>95%) with specific indicators and categorical encoding.
-- **Optimization**: Integrated Optuna support for hyperparameter tuning.
+## Key Features
+- **Gated Mixture of Experts (MoE)**: Specialized routing between Subjective (Questionnaire) and Objective (Lab/Exam) data components.
+- **Gradient Boosting Machine (GBM)**: Standard GBM model for comparison.
+- **Random Forest (RF)**: Standard RF model for comparison.
+- **Logistic Regression (LR)**: Standard LR model for comparison.
+- **Auto-Optimized Feature Selection**: Optuna-driven hyperparameter optimization and feature selection.
+- **Advanced EDA**: Automated sparsity analysis with detailed justification for feature removal.
+- **Interpretable SHAP**: Explainable AI features importance.
+
 
 ## Setup
-Ensure you have the required dependencies installed:
 ```bash
 pip install -r requirements.txt
 ```
 
-
-## Usage
+## Usage Guide
 
 ### 1. Exploratory Data Analysis (EDA)
-Generate sparsity reports and distribution plots:
+Generate sparsity reports, target-conditional distributions, and filtering justifications:
 ```powershell
 python ml_pipeline/main.py analyze --data-path data/data.csv --metadata-path data/features_metadata.csv
 ```
-Outputs are saved to `outputs/eda/`.
+*Outputs: `outputs/eda/` including `potential_drops_details.csv`.*
 
-### 2. Training
-**Fast Debug Run (Subsample):**
+### 2. Hyperparameter & FS Optimization
+Find the best model parameters **and** feature selection thresholds simultaneously:
 ```powershell
-python ml_pipeline/main.py train --model baseline --data-path data/data.csv --subsample 1000
+# Optimize the "fancy" MoE model
+python ml_pipeline/main.py optimize --model moe --n-trials 50
+
+# Or optimize a standard GBM
+python ml_pipeline/main.py optimize --model gbm --n-trials 50
+```
+*Best parameters are saved to `outputs/optimization/best_params_[model].json`.*
+
+### 3. Training
+Train with cross-validation and generate a detailed feature selection report:
+```powershell
+# Train MoE with optimized parameters
+python ml_pipeline/main.py train --model moe --params-path outputs/optimization/best_params_moe.json
 ```
 
-**Full Training (LightGBM):**
+### 4. Prediction & Explainability
+Generate submission files and SHAP waterfall plots with descriptive feature names:
 ```powershell
-python ml_pipeline/main.py train --model gbm --data-path data/data.csv
+# Generate predictions
+python ml_pipeline/main.py predict --model moe
+
+# Generate SHAP explanations (Descriptive names are used automatically)
+python ml_pipeline/main.py explain --model moe --data-path data/data.csv
 ```
 
-### 3. Hyperparameter Optimization
-Find the best parameters using Optuna:
-```powershell
-python ml_pipeline/main.py optimize --model gbm --data-path data/data.csv --n-trials 50
-```
-Best parameters are saved to `outputs/optimization/best_params_gbm.json`.
+### 5. Streamlit app
 
-**Train with Optimized Parameters:**
 ```powershell
-python ml_pipeline/main.py train --model gbm --data-path data/data.csv --params-path outputs/optimization/best_params_gbm.json
+streamlit run app.py
 ```
 
-### 4. Prediction (Inference)
-Generate predictions for submission (defaults to predicting on **ALL** rows in `data.csv`):
-```powershell
-python ml_pipeline/main.py predict --model gbm
-```
-Output: `outputs/predictions.csv` (One column: `y`).
 
-**Predict on specific Test Indexes:**
-```powershell
-python ml_pipeline/main.py predict --model gbm --test-indexes data/test_indexes.csv
-```
-
-## outputs structure
-- `outputs/models/`: Saved models and pipelines.
-- `outputs/eda/`: EDA plots.
-- `outputs/optimization/`: Best hyperparameters.
-- `outputs/predictions.csv`: Final inference file.
+##  Project Structure
+- `ml_pipeline/models/moe.py`: Gated Mixture of Experts implementation.
+- `ml_pipeline/feature_filtering.py`: Logic for automated feature selection and reporting.
+- `outputs/eda/`: Visual justifications for data filtering.
+- `outputs/optimization/`: Best hyperparameter configurations.
+- `outputs/feature_selection_report.json`: Justification for every dropped feature.

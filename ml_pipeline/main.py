@@ -29,6 +29,7 @@ from ml_pipeline.inference.predict import run_inference
 from ml_pipeline.explanation.shap_explainer import run_shap_analysis
 from ml_pipeline.utils.cache import load_from_cache, save_to_cache
 from ml_pipeline.models.ensemble import load_models_from_paths
+from ml_pipeline.models.moe import GatedMoEModel
 
 logger = setup_logger("main")
 
@@ -135,6 +136,12 @@ def train(args):
     y = df[TARGET_COLUMN]
     X = df.drop(columns=[TARGET_COLUMN])
     
+    # Load Params once for the entire session
+    params = {}
+    if args.params_path:
+        params = load_json(args.params_path)
+        logger.info(f"Loaded hyperparameters from {args.params_path}")
+
     # 2. Cross Validation Setup
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     
@@ -152,7 +159,11 @@ def train(args):
         # A. Feature Filtering
         # Create output path for report only for first fold or separate?
         # Let's not save report for every fold to avoid clutter, or save to distinct files.
-        selector = FeatureSelector(output_report_path=None) 
+        selector = FeatureSelector(
+            max_missing_rate=params.get("max_missing_rate", 0.80),
+            variance_threshold=params.get("variance_threshold", 0.1),
+            output_report_path=None
+        ) 
         selector.fit(X_train_fold, y_train_fold)
         X_train_sel = selector.transform(X_train_fold)
         X_val_sel = selector.transform(X_val_fold)
@@ -164,17 +175,19 @@ def train(args):
         X_val_proc = pipeline.transform(X_val_sel)
         
         # C. Model
-        params = {}
-        if args.params_path:
-             params = load_json(args.params_path)
-             
+        model_params = {k: v for k, v in params.items() if k not in ["max_missing_rate", "variance_threshold"]}
+        
         model = None
         if args.model == "baseline":
-            model = LogisticRegressionModel(**params)
+            model = LogisticRegressionModel(**model_params)
         elif args.model == "rf":
-            model = RandomForestModel(**params)
+            model = RandomForestModel(**model_params)
         elif args.model == "gbm":
-            model = GradientBoostingModel(backend=args.gbm_backend, **params)
+            model = GradientBoostingModel(backend=args.gbm_backend, **model_params)
+        elif args.model == "moe":
+            metadata = pd.read_csv(args.metadata_path)
+            comp_indices = pipeline.get_component_feature_indices(metadata)
+            model = GatedMoEModel(component_indices=comp_indices, gbm_params=model_params)
             
         # Get categorical indices for LightGBM
         cat_indices = pipeline.get_categorical_indices()
@@ -209,7 +222,11 @@ def train(args):
     logger.info("Retraining on full dataset...")
     
     # Feature Selection
-    final_selector = FeatureSelector(output_report_path=OUTPUTS_DIR / "feature_selection_report.json")
+    final_selector = FeatureSelector(
+        max_missing_rate=params.get("max_missing_rate", 0.80),
+        variance_threshold=params.get("variance_threshold", 0.1),
+        output_report_path=OUTPUTS_DIR / "feature_selection_report.json"
+    )
     final_selector.fit(X, y)
     X_sel = final_selector.transform(X)
     
@@ -219,13 +236,18 @@ def train(args):
     X_proc = final_pipeline.transform(X_sel)
     
     # Model
+    model_params = {k: v for k, v in params.items() if k not in ["max_missing_rate", "variance_threshold"]}
     final_model = None
     if args.model == "baseline":
-        final_model = LogisticRegressionModel(**params)
+        final_model = LogisticRegressionModel(**model_params)
     elif args.model == "rf":
-        final_model = RandomForestModel(**params)
+        final_model = RandomForestModel(**model_params)
     elif args.model == "gbm":
-        final_model = GradientBoostingModel(backend=args.gbm_backend, **params)
+        final_model = GradientBoostingModel(backend=args.gbm_backend, **model_params)
+    elif args.model == "moe":
+        metadata = pd.read_csv(args.metadata_path)
+        comp_indices = final_pipeline.get_component_feature_indices(metadata)
+        final_model = GatedMoEModel(component_indices=comp_indices, gbm_params=model_params)
 
     cat_indices = final_pipeline.get_categorical_indices()
     
@@ -248,7 +270,21 @@ def train(args):
 def optimize(args):
     """Hyperparameter Optimization."""
     
-    X_train, X_val, y_train, y_val, pipeline = get_data_splits(args.data_path)
+    # Load Raw Data for Optimization
+    df = load_data(args.data_path)
+    ground_truth_path = Path(args.data_path).parent / "ground_truth_train.csv"
+    if ground_truth_path.exists():
+        labels = pd.read_csv(ground_truth_path)
+        if ID_COLUMN in df.columns and ID_COLUMN in labels.columns:
+            df = df.merge(labels, on=ID_COLUMN, how="inner")
+            
+    # User Request: Subsample
+    if hasattr(args, 'subsample') and args.subsample:
+        logger.warning(f"Subsampling data to {args.subsample} rows for optimization debugging.")
+        df = df.head(args.subsample)
+        
+    y = df[TARGET_COLUMN]
+    X = df.drop(columns=[TARGET_COLUMN])
     
     models_to_opt = []
     if args.model == "all":
@@ -259,7 +295,8 @@ def optimize(args):
     logger.info(f"Optimizing {models_to_opt} with {args.n_trials} trials... Backend for GBM: {args.gbm_backend}")
 
     # Pass gbm_backend to optimizer
-    optimizer = HyperparameterOptimizer(models_to_opt, X_train, y_train.values, n_trials=args.n_trials, gbm_backend=args.gbm_backend)
+    # Pass raw X, y to optimizer
+    optimizer = HyperparameterOptimizer(models_to_opt, X, y, n_trials=args.n_trials, gbm_backend=args.gbm_backend, metadata_path=args.metadata_path)
     
     # Save results
     opt_dir = OUTPUTS_DIR / "optimization"
@@ -393,7 +430,8 @@ def main():
     # Train
     p_train = subparsers.add_parser("train", help="Train a model")
     p_train.add_argument("--data-path", type=str, required=True, help="Path to training data CSV")
-    p_train.add_argument("--model", type=str, choices=["baseline", "rf", "gbm"], required=True, help="Model to train")
+    p_train.add_argument("--metadata-path", type=str, default="data/features_metadata.csv", help="Path to metadata csv")
+    p_train.add_argument("--model", type=str, choices=["baseline", "rf", "gbm", "moe"], required=True, help="Model to train")
     p_train.add_argument("--gbm-backend", type=str, choices=["lightgbm", "xgboost"], default="lightgbm", help="Backend for GBM model")
     p_train.add_argument("--params-path", type=str, help="Path to JSON file with optimized hyperparameters")
     p_train.add_argument("--subsample", type=int, help="Number of rows to subsample for debugging")
@@ -401,9 +439,11 @@ def main():
     # Optimize
     p_optimize = subparsers.add_parser("optimize", help="Run Hyperparameter Optimization")
     p_optimize.add_argument("--data-path", type=str, required=True, help="Path to training data CSV")
-    p_optimize.add_argument("--model", type=str, choices=["baseline", "rf", "gbm", "all"], required=True, help="Model to optimize")
+    p_optimize.add_argument("--metadata-path", type=str, default="data/features_metadata.csv", help="Path to metadata csv")
+    p_optimize.add_argument("--model", type=str, choices=["baseline", "rf", "gbm", "moe", "all"], required=True, help="Model to optimize")
     p_optimize.add_argument("--n-trials", type=int, default=20, help="Number of trials")
     p_optimize.add_argument("--gbm-backend", type=str, choices=["lightgbm", "xgboost"], default="lightgbm", help="Backend for GBM model")
+    p_optimize.add_argument("--subsample", type=int, help="Number of rows to subsample for debugging")
 
     # Predict
     p_predict = subparsers.add_parser("predict", help="Run Inference")
