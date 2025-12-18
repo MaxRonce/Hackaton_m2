@@ -1,101 +1,67 @@
-# Hackaton Machine Learning Pipeline
+# Medical Mortality Prediction Pipeline (Hackathon M2)
 
-A generic, production-ready machine learning pipeline for binary classification on tabular data. Built with Python, Scikit-Learn, LightGBM, and Optuna.
+This repository contains an adapted Machine Learning pipeline designed for a sparse medical dataset (~59k rows, ~1.5k features). It is optimized for F1-score and utilizes LightGBM/XGBoost with robust preprocessing for handling missing data.
 
 ## Features
+- **Advanced EDA**: Automated sparsity and metadata-driven analysis.
+- **Robust Preprocessing**: Handles high missingness (>95%) with specific indicators and categorical encoding.
+- **Optimization**: Integrated Optuna support for hyperparameter tuning.
+- **Strict Inference**: Ensures alignment with submission requirements (full dataset prediction).
+- **Fast Iteration**: Subsampling support for quick debugging.
 
-- **Automated EDA**: Generate distribution plots and correlation maps automatically.
-- **Modular Pipeline**: Clean separation of data, models, and evaluation.
-- **Multiple Models**: Logistic Regression (Baseline), Random Forest, and Gradient Boosting (LightGBM/XGBoost).
-- **Hyperparameter Tuning**: Bayesian optimization using Optuna.
-- **Reproducibility**: Seeded random states and reusable preprocessing pipelines.
-- **CLI Interface**: Full control via command line arguments.
-
-## Installation
-
-1. Clone the repository.
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Setup
+Ensure you have the required dependencies installed:
+```bash
+pip install -r requirements.txt
+```
+*(If `requirements.txt` is missing, install: `pandas numpy scikit-learn lightgbm xgboost optuna seaborn matplotlib`)*
 
 ## Usage
 
-The pipeline is controlled via `ml_pipeline/main.py`.
+### 1. Exploratory Data Analysis (EDA)
+Generate sparsity reports and distribution plots:
+```powershell
+python ml_pipeline/main.py analyze --data-path data/data.csv --metadata-path data/features_metadata.csv
+```
+Outputs are saved to `outputs/eda/`.
 
-### 1. Data Analysis (EDA)
-Generate automated reports (saved to `outputs/eda/`):
-```bash
-python ml_pipeline/main.py analyze --data-path data/train.csv
+### 2. Training
+**Fast Debug Run (Subsample):**
+```powershell
+python ml_pipeline/main.py train --model baseline --data-path data/data.csv --subsample 1000
 ```
 
-### 2. Model Training
-Train a model. Available models: `baseline`, `rf` (Random Forest), `gbm` (Gradient Boosting).
-```bash
-# Default
-python ml_pipeline/main.py train --model gbm --data-path data/train.csv
-
-# With Optimized Params
-python ml_pipeline/main.py train --model gbm --params-path outputs/models/gbm_best_params.json --data-path data/train.csv
+**Full Training (LightGBM):**
+```powershell
+python ml_pipeline/main.py train --model gbm --data-path data/data.csv
 ```
-Artifacts created:
-- Model: `outputs/models/{model}_model.pkl`
-- Metrics: `outputs/{model}_metrics.json`
-- Plots: `outputs/{model}_roc.png`, `outputs/{model}_cm.png`
 
 ### 3. Hyperparameter Optimization
-Optimize a model using Optuna. You can optimize a specific model or **all** models at once.
-```bash
-# Optimize a single model
-python ml_pipeline/main.py optimize --model gbm --gbm-backend xgboost --data-path data/train.csv --n-trials 50
-
-# Optimize ALL models (Baseline, RF, GBM) and compare results
-python ml_pipeline/main.py optimize --model all --data-path data/train.csv --n-trials 20
+Find the best parameters using Optuna:
+```powershell
+python ml_pipeline/main.py optimize --model gbm --data-path data/data.csv --n-trials 50
 ```
-Best search parameters are saved to `outputs/models/{model}_best_params.json` and a comparison plot is saved to `outputs/models/optimization_comparison.png`.
+Best parameters are saved to `outputs/optimization/best_params_gbm.json`.
 
-### 4. Explainability (SHAP)
-Generate SHAP plots (Summary and Importance Bar) to explain model predictions.
-```bash
-python ml_pipeline/main.py explain --model gbm --data-path data/train.csv
-```
-Plots are saved to `outputs/explanation/`.
-
-### 5. Ensemble Learning
-Combine predictions from multiple trained models (Soft Voting).
-```bash
-python ml_pipeline/main.py ensemble \
-    --test-path data/test.csv \
-    --model-paths outputs/models/gbm_model.pkl outputs/models/rf_model.pkl \
-    --output-path outputs/ensemble_submission.csv
+**Train with Optimized Parameters:**
+```powershell
+python ml_pipeline/main.py train --model gbm --data-path data/data.csv --params-path outputs/optimization/best_params_gbm.json
 ```
 
-### 6. Interactive Interface (Streamlit)
-Launch the graphical interface for EDA and real-time inference.
-```bash
-streamlit run app.py
+### 4. Prediction (Inference)
+Generate predictions for submission (defaults to predicting on **ALL** rows in `data.csv`):
+```powershell
+python ml_pipeline/main.py predict --model gbm
+```
+Output: `outputs/predictions.csv` (One column: `y`).
+
+**Predict on specific Test Indexes:**
+```powershell
+python ml_pipeline/main.py predict --model gbm --test-indexes data/test_indexes.csv
 ```
 
-### 7. Inference
-Generate predictions on a new dataset using a trained model.
-```bash
-python ml_pipeline/main.py predict \
-    --test-path data/test.csv \
-    --model-path outputs/models/gbm_model.pkl \
-    --output-path outputs/predictions.csv
-```
-Output format is strictly `id,prediction`.
-
-## Project Structure
-
-```
-ml_pipeline/
-├── data/           # Data loading & preprocessing
-├── models/         # Model implementations (RF, GBM, Baseline)
-├── evaluation/     # Metrics & Plotting
-├── optimization/   # Optuna Hyperparameter Search
-├── inference/      # Prediction logic
-├── utils/          # Logging & IO helpers
-├── config.py       # Global Configuration
-└── main.py         # CLI Entry Point
-```
+## outputs structure
+- `outputs/models/`: Saved models and pipelines.
+- `outputs/eda/`: EDA plots.
+- `outputs/optimization/`: Best hyperparameters.
+- `outputs/predictions.csv`: Final inference file.
