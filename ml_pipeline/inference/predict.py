@@ -3,46 +3,106 @@ import numpy as np
 from pathlib import Path
 from ..utils.io import load_pickle
 from ..data.loader import load_data
-from ..config import ID_COLUMN
+from ..config import ID_COLUMN, TARGET_COLUMN
 
-def run_inference(test_path: str, model_path: str, pipeline_path: str, output_path: str):
+from ..utils.io import load_json
+
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+def run_inference(data_path: str, model_path: str, pipeline_path: str, selector_path: str, threshold_path: str, output_path: str, test_indexes_path: Optional[str] = None):
     """
-    Run inference on test data.
-    
-    Args:
-        test_path (str): Path to test CSV.
-        model_path (str): Path to saved model pickle.
-        pipeline_path (str): Path to saved preprocessing pipeline pickle.
-        output_path (str): Path to save submission CSV.
+    Run inference on data.
     """
-    # Load assets
+    # 1. Load Assets
     model = load_pickle(model_path)
     pipeline = load_pickle(pipeline_path)
+    selector = load_pickle(selector_path)
+    threshold_data = load_json(threshold_path)
+    best_thresh = threshold_data["threshold"]
     
-    # Load data
-    df_test = load_data(test_path)
+    # 2. Load Data
+    df = load_data(data_path)
+    if ID_COLUMN not in df.columns:
+         raise ValueError(f"ID column {ID_COLUMN} missing in data.")
     
-    # Preprocess
-    # Ensure ID column is preserved for output
-    if ID_COLUMN not in df_test.columns:
-        raise ValueError(f"ID column '{ID_COLUMN}' not found in test data.")
+    df_indexed = df.set_index(ID_COLUMN)
+    
+    # Determine Target IDs
+    if test_indexes_path:
+        test_idx_df = pd.read_csv(test_indexes_path, header=None)
+        target_ids = test_idx_df.iloc[:, 0].values
+        logger.info(f"Predicting on {len(target_ids)} IDs from {test_indexes_path}")
         
-    ids = df_test[ID_COLUMN]
-    X_test = pipeline.transform(df_test)
+        # Reindex to target_ids (Force alignment)
+        X_test_aligned = df_indexed.reindex(target_ids)
+        
+        # Check for missing data
+        missing_ids_count = X_test_aligned.isnull().all(axis=1).sum()
+        if missing_ids_count > 0:
+            logger.warning(f"WARNING: {missing_ids_count} requested IDs were not found in data.csv. They will be imputed as fully missing.")
+            
+    else:
+        # Full prediction
+        logger.info(f"Predicting on all {len(df)} rows in {data_path}")
+        target_ids = df_indexed.index.values
+        X_test_aligned = df_indexed
+        
+    # 4. Transform
+    # Feature Selection
+    X_sel = selector.transform(X_test_aligned)
     
-    # Predict
-    # The requirement is "id, prediction" where prediction is a probability?
-    # "Output CSV strictly formatted as: id,prediction 123,0.8421"
-    # This implies prediction probability of the positive class.
+    # Preprocessing
+    X_proc = pipeline.transform(X_sel)
     
-    preds_proba = model.predict_proba(X_test)[:, 1]
+    # 5. Predict
+    preds_proba = model.predict_proba(X_proc)[:, 1]
     
-    # Create submission DataFrame
-    submission = pd.DataFrame({
-        "id": ids,
-        "prediction": np.round(preds_proba, 4)
-    })
+    # Apply Threshold
+    preds_label = (preds_proba >= best_thresh).astype(int)
     
-    # Save
+    # 6. Save
+    # "Expected 59064 labels". User wants one column? Or ID and Prediction?
+    # User comment: "Output saved to outputs/predictions.csv. File Format error Expected 59064 labels got 2954 instead !"
+    # The previous code saved "prediction" column only (from `pd.DataFrame(preds_label, columns=[TARGET_COLUMN])`).
+    # If the user wants to be safe, I should probably save ID and Prediction if the format allows, 
+    # but the user initially said "exactly one column of predictions".
+    # I'll stick to one column BUT predict on ALL rows.
+    
+    submission = pd.DataFrame(preds_label, columns=[TARGET_COLUMN])
     submission.to_csv(output_path, index=False)
-    print(f"Predictions saved to {output_path}")
+    
+    logger.info(f"Predictions saved to {output_path} with threshold {best_thresh:.4f}")
+        
+    # 4. Transform
+    # Feature Selection
+    X_sel = selector.transform(X_test_aligned)
+    
+    # Preprocessing
+    X_proc = pipeline.transform(X_sel)
+    
+    # 5. Predict
+    preds_proba = model.predict_proba(X_proc)[:, 1]
+    
+    # Apply Threshold
+    preds_label = (preds_proba >= best_thresh).astype(int)
+    
+    # 6. Save
+    # "Output file must contain exactly one column of predictions"
+    # Does "one column" mean just values 0/1/0? Or ID, Prediction?
+    # Prompt: "Output file must contain exactly one column of predictions"
+    # Prompt: "Include strict checks: Row count, Index alignment"
+    # If strict ordering is required, just the column of predictions is often requested to paste/upload.
+    # I will save as single column with header "y" per target config? Or headerless?
+    # "Output file must contain exactly one column of predictions" -> Sounds like NO ID column.
+    # I will verify this interpreting.
+    
+    submission = pd.DataFrame(preds_label, columns=[TARGET_COLUMN]) # Using config target name 'y'
+    
+    # Write to CSV
+    submission.to_csv(output_path, index=False)
+    
+    print(f"Predictions saved to {output_path} with threshold {best_thresh:.4f}")
+

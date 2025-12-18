@@ -37,21 +37,32 @@ class PreprocessingPipeline:
         logger.info(f"Categorical features: {self.cat_features}")
         
         # Define transformers
+        # Numeric: Median imputation + Missing Indicator + Robust Scaling (better for outliers)
         numeric_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            ('scaler', StandardScaler()) # RobustScaler might be better but let's stick to Standard or None for now as per prior plan mention? 
+                                         # User Prompt said "Scaling standard" was risky, proposed "Median imputation (after filtering)".
+                                         # Let's use RobustScaler as I planned in "implementation_plan.md" (Optional clipping... I said RobustScaler in plan text)
+                                         # Actually, I'll use RobustScaler.
+        ])
+        from sklearn.preprocessing import RobustScaler
+        numeric_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            ('scaler', RobustScaler()) 
         ])
         
+        # Categorical: explicit MISSING, Ordinal Encoding for LightGBM
         categorical_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='most_frequent')),
-            ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+            ('imputer', SimpleImputer(strategy='constant', fill_value='MISSING')),
+            ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
         ])
         
         self.pipeline = ColumnTransformer(
             transformers=[
                 ('num', numeric_transformer, self.num_features),
                 ('cat', categorical_transformer, self.cat_features)
-            ]
+            ],
+            verbose_feature_names_out=False # Clean names
         )
         
         self.pipeline.fit(X_clean, y)
@@ -93,3 +104,19 @@ class PreprocessingPipeline:
             cols_to_drop.append(self.target_col)
             
         return df.drop(columns=cols_to_drop)
+
+
+    def get_categorical_indices(self) -> List[int]:
+        """
+        Returns indices of categorical columns in the transformed array.
+        Assumes 'num' then 'cat' order in ColumnTransformer.
+        """
+        if self.pipeline is None:
+            return []
+        
+        # In ColumnTransformer, output is concatenated in order of transformers
+        n_num = len(self.num_features)
+        n_cat = len(self.cat_features)
+        
+        # Cat indices start after Num indices
+        return list(range(n_num, n_num + n_cat))

@@ -32,8 +32,16 @@ class GradientBoostingModel(BaseModel):
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'GradientBoostingModel':
-        self.model.fit(X, y)
+    def fit(self, X: np.ndarray, y: np.ndarray, categorical_feature: list = None) -> 'GradientBoostingModel':
+        if self.backend == "lightgbm" and categorical_feature is not None:
+             self.model.fit(X, y, categorical_feature=categorical_feature)
+        elif self.backend == "xgboost":
+             # XGBoost handles categorical differently (enable_categorical=True and use category dtype, which requires DF usually)
+             # But we are passing numpy array. XGBoost support for cat indices in numpy is limited/need generic DMatrix.
+             # For now, only support explicit cat feature for LightGBM as primary model.
+             self.model.fit(X, y)
+        else:
+             self.model.fit(X, y)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:

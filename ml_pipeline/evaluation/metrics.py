@@ -16,7 +16,7 @@ def evaluate_model(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) 
     """
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
-        "f1_score": f1_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred),
         "roc_auc": roc_auc_score(y_true, y_proba)
     }
     return metrics

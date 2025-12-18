@@ -9,7 +9,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from ml_pipeline.config import (
     DATA_DIR, MODELS_DIR, EDA_DIR, OUTPUTS_DIR, 
-    TARGET_COLUMN, SEED
+    TARGET_COLUMN, ID_COLUMN, SEED
 )
 from ml_pipeline.utils.logger import setup_logger
 from ml_pipeline.utils.io import save_pickle, load_pickle, save_json, load_json
@@ -45,6 +45,19 @@ def get_data_splits(data_path):
         return cached_data
         
     df = load_data(data_path)
+    
+    # Merge with ground truth if target missing (Optimization/Splits need target)
+    if TARGET_COLUMN not in df.columns:
+        ground_truth_path = Path(data_path).parent / "ground_truth_train.csv"
+        if ground_truth_path.exists():
+            labels = pd.read_csv(ground_truth_path)
+            if ID_COLUMN in df.columns and ID_COLUMN in labels.columns:
+                 df = df.merge(labels, on=ID_COLUMN, how="inner")
+                 logger.info("Merged data with ground_truth_train.csv for splits.")
+                 
+    if TARGET_COLUMN not in df.columns:
+         raise ValueError(f"Target column {TARGET_COLUMN} not found in {data_path} (even after attempted merge).")
+         
     y = df[TARGET_COLUMN]
     
     from sklearn.model_selection import train_test_split
@@ -65,56 +78,172 @@ def get_data_splits(data_path):
 
 def analyze(args):
     """Run EDA."""
-    data_path = args.data_path
-    df = load_data(data_path)
-    eda = AutoEDA(df)
-    eda.run()
+    from ml_pipeline.config import EDA_DIR
+    from ml_pipeline.eda_advanced import run_advanced_eda
+    
+    logger.info(f"Running analysis on {args.data_path}")
+    run_advanced_eda(
+        data_path=Path(args.data_path),
+        metadata_path=Path(args.metadata_path),
+        output_dir=EDA_DIR
+    )
+
+
+from sklearn.model_selection import StratifiedKFold
+from ml_pipeline.feature_filtering import FeatureSelector
+from ml_pipeline.optimization.threshold import optimize_threshold
 
 def train(args):
-    """Train a model."""
+    """Train a model with CV and Feature Selection."""
     logger.info(f"Training {args.model} model...")
     
-    # Load Data with Cache
-    X_train, X_val, y_train, y_val, pipeline = get_data_splits(args.data_path)
+    # 1. Load Data
+    # Merge data and ground truth
+    df = load_data(args.data_path)
+    # We need labels. Assuming ground_truth_train.csv is in the data dir or we use the labels in data.csv if merged?
+    # User said "Provided files: data.csv, ground_truth_train.csv". 
+    # Usually data.csv is features, ground_truth is labels.
+    # Let's check if 'y' (target) is in data.csv. If not, merge.
+    # Earlier head of data.csv showed SEQN...
+    # head of ground_truth showed SEQN, y.
+    # So we must merge.
     
-    # Preprocessing pipeline is already fitted and saved in get_data_splits if not cached, 
-    # or just loaded if cached. We rely on get_data_splits to handle saving pipeline.
+    ground_truth_path = Path(args.data_path).parent / "ground_truth_train.csv"
+    if ground_truth_path.exists():
+        labels = pd.read_csv(ground_truth_path)
+        # Merge on ID
+        if ID_COLUMN in df.columns and ID_COLUMN in labels.columns:
+            df = df.merge(labels, on=ID_COLUMN, how="inner")
+        else:
+             logger.warning("Could not merge labels automatically. Assuming target is in data.")
     
-    # Initialise Model
-    params = {}
-    if args.params_path:
-        logger.info(f"Loading parameters from {args.params_path}")
-        params = load_json(args.params_path)
-
-    model = None
-    if args.model == "baseline":
-        model = LogisticRegressionModel(**params)
-    elif args.model == "rf":
-        model = RandomForestModel(**params)
-    elif args.model == "gbm":
-        model = GradientBoostingModel(backend=args.gbm_backend, **params)
-    else:
-        raise ValueError(f"Unknown model: {args.model}")
+    
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Target column {TARGET_COLUMN} not found in data.")
         
-    # Fit
-    model.fit(X_train, y_train.values)
+    # User Request: Save merged dataset
+    merged_path = Path(args.data_path).parent / "data_merged.csv"
+    if not merged_path.exists():
+        df.to_csv(merged_path, index=False)
+        logger.info(f"Saved merged dataset to {merged_path}")
+        
+    # User Request: Subsample
+    if args.subsample:
+        logger.warning(f"Subsampling data to {args.subsample} rows for debugging.")
+        df = df.head(args.subsample)
+        
+    y = df[TARGET_COLUMN]
+    X = df.drop(columns=[TARGET_COLUMN])
     
-    # Predict
-    y_pred = model.predict(X_val)
-    y_proba = model.predict_proba(X_val)[:, 1]
+    # 2. Cross Validation Setup
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     
-    # Evaluate
-    metrics = evaluate_model(y_val, y_pred, y_proba)
-    logger.info(f"Metrics: {metrics}")
+    oof_preds = np.zeros(len(df))
+    oof_probs = np.zeros(len(df))
     
-    # Save artifacts
-    save_json(metrics, OUTPUTS_DIR / f"{args.model}_metrics.json")
-    plot_roc_curve(y_val, y_proba, OUTPUTS_DIR / f"{args.model}_roc.png")
-    plot_confusion_matrix(y_val, y_pred, OUTPUTS_DIR / f"{args.model}_cm.png")
+    fold_f1s = []
     
-    # Save Model
-    model.save(MODELS_DIR / f"{args.model}_model.pkl")
-    logger.info("Training complete.")
+    logger.info("Starting 5-Fold Cross-Validation...")
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
+        y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+        
+        # A. Feature Filtering
+        # Create output path for report only for first fold or separate?
+        # Let's not save report for every fold to avoid clutter, or save to distinct files.
+        selector = FeatureSelector(output_report_path=None) 
+        selector.fit(X_train_fold, y_train_fold)
+        X_train_sel = selector.transform(X_train_fold)
+        X_val_sel = selector.transform(X_val_fold)
+        
+        # B. Preprocessing
+        pipeline = PreprocessingPipeline(target_col=TARGET_COLUMN)
+        pipeline.fit(X_train_sel, y_train_fold)
+        X_train_proc = pipeline.transform(X_train_sel)
+        X_val_proc = pipeline.transform(X_val_sel)
+        
+        # C. Model
+        params = {}
+        if args.params_path:
+             params = load_json(args.params_path)
+             
+        model = None
+        if args.model == "baseline":
+            model = LogisticRegressionModel(**params)
+        elif args.model == "rf":
+            model = RandomForestModel(**params)
+        elif args.model == "gbm":
+            model = GradientBoostingModel(backend=args.gbm_backend, **params)
+            
+        # Get categorical indices for LightGBM
+        cat_indices = pipeline.get_categorical_indices()
+        
+        # Fit
+        if args.model == "gbm" and args.gbm_backend == "lightgbm":
+             model.fit(X_train_proc, y_train_fold.values, categorical_feature=cat_indices)
+        else:
+             model.fit(X_train_proc, y_train_fold.values)
+             
+        # Predict
+        probs = model.predict_proba(X_val_proc)[:, 1]
+        oof_probs[val_idx] = probs
+        
+        # We don't have optimal threshold yet, use 0.5 for fold metrics log
+        preds = (probs >= 0.5).astype(int)
+        fold_score = evaluate_model(y_val_fold, preds, probs)["f1"]
+        fold_f1s.append(fold_score)
+        
+        logger.info(f"Fold {fold+1} F1: {fold_score:.4f}")
+        
+    logger.info(f"Mean CV F1 (thresh=0.5): {np.mean(fold_f1s):.4f} +/- {np.std(fold_f1s):.4f}")
+    
+    # 3. Optimization
+    # Optimize threshold on OOF
+    best_thresh, best_f1 = optimize_threshold(y, oof_probs)
+    
+    # Save best threshold
+    save_json({"threshold": best_thresh, "cv_f1": best_f1}, OUTPUTS_DIR / "best_threshold.json")
+    
+    # 4. Final Retraining
+    logger.info("Retraining on full dataset...")
+    
+    # Feature Selection
+    final_selector = FeatureSelector(output_report_path=OUTPUTS_DIR / "feature_selection_report.json")
+    final_selector.fit(X, y)
+    X_sel = final_selector.transform(X)
+    
+    # Preprocessing
+    final_pipeline = PreprocessingPipeline(target_col=TARGET_COLUMN)
+    final_pipeline.fit(X_sel, y)
+    X_proc = final_pipeline.transform(X_sel)
+    
+    # Model
+    final_model = None
+    if args.model == "baseline":
+        final_model = LogisticRegressionModel(**params)
+    elif args.model == "rf":
+        final_model = RandomForestModel(**params)
+    elif args.model == "gbm":
+        final_model = GradientBoostingModel(backend=args.gbm_backend, **params)
+
+    cat_indices = final_pipeline.get_categorical_indices()
+    
+    if args.model == "gbm" and args.gbm_backend == "lightgbm":
+         final_model.fit(X_proc, y.values, categorical_feature=cat_indices)
+    else:
+         final_model.fit(X_proc, y.values)
+         
+    # Save Artifacts
+    save_pickle(final_selector, MODELS_DIR / "feature_selector.pkl")
+    save_pickle(final_pipeline, MODELS_DIR / "preprocessing_pipeline.pkl")
+    final_model.save(MODELS_DIR / f"{args.model}_model.pkl")
+    
+    # Save CV plots
+    plot_roc_curve(y, oof_probs, OUTPUTS_DIR / "cv_roc_curve.png")
+    
+    logger.info("Training pipeline complete.")
+
 
 def optimize(args):
     """Hyperparameter Optimization."""
@@ -131,7 +260,15 @@ def optimize(args):
 
     # Pass gbm_backend to optimizer
     optimizer = HyperparameterOptimizer(models_to_opt, X_train, y_train.values, n_trials=args.n_trials, gbm_backend=args.gbm_backend)
-    results = optimizer.optimize_all(MODELS_DIR)
+    
+    # Save results
+    opt_dir = OUTPUTS_DIR / "optimization"
+    results = optimizer.optimize_all(opt_dir)
+    
+    for model, params in results.items():
+        out_file = opt_dir / f"best_params_{model}.json"
+        save_json(params, out_file)
+        logger.info(f"Saved best params for {model} to {out_file}")
     
     for model_name, params in results.items():
         save_json(params, MODELS_DIR / f"{model_name}_best_params.json")
@@ -173,11 +310,20 @@ def explain(args):
 
 def predict(args):
     """Inference."""
+    # Construct paths
+    model_path = MODELS_DIR / f"{args.model}_model.pkl"
+    pipeline_path = MODELS_DIR / "preprocessing_pipeline.pkl"
+    selector_path = MODELS_DIR / "feature_selector.pkl"
+    threshold_path = OUTPUTS_DIR / "best_threshold.json"
+    
     run_inference(
-        args.test_path, 
-        args.model_path, 
-        args.pipeline_path, 
-        args.output_path
+        data_path=args.data_path,
+        model_path=model_path,
+        pipeline_path=pipeline_path,
+        selector_path=selector_path,
+        threshold_path=threshold_path,
+        output_path=args.output_path,
+        test_indexes_path=args.test_indexes
     )
 
 def ensemble(args):
@@ -210,8 +356,9 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Analyze
-    p_analyze = subparsers.add_parser("analyze", help="Run Automated EDA")
-    p_analyze.add_argument("--data-path", type=str, required=True, help="Path to training data CSV")
+    parser_analyze = subparsers.add_parser("analyze", help="Run EDA")
+    parser_analyze.add_argument("--data-path", type=str, required=True, help="Path to data csv")
+    parser_analyze.add_argument("--metadata-path", type=str, required=True, help="Path to metadata csv")
 
     # Train
     p_train = subparsers.add_parser("train", help="Train a model")
@@ -219,6 +366,7 @@ def main():
     p_train.add_argument("--model", type=str, choices=["baseline", "rf", "gbm"], required=True, help="Model to train")
     p_train.add_argument("--gbm-backend", type=str, choices=["lightgbm", "xgboost"], default="lightgbm", help="Backend for GBM model")
     p_train.add_argument("--params-path", type=str, help="Path to JSON file with optimized hyperparameters")
+    p_train.add_argument("--subsample", type=int, help="Number of rows to subsample for debugging")
 
     # Optimize
     p_optimize = subparsers.add_parser("optimize", help="Run Hyperparameter Optimization")
@@ -229,9 +377,9 @@ def main():
 
     # Predict
     p_predict = subparsers.add_parser("predict", help="Run Inference")
-    p_predict.add_argument("--test-path", type=str, required=True, help="Path to test data CSV")
-    p_predict.add_argument("--model-path", type=str, required=True, help="Path to saved model pkl")
-    p_predict.add_argument("--pipeline-path", type=str, default=str(MODELS_DIR / "preprocessing_pipeline.pkl"), help="Path to saved pipeline pkl")
+    p_predict.add_argument("--test-indexes", type=str, help="Path to test indexes CSV (Optional, defaults to all data)")
+    p_predict.add_argument("--data-path", type=str, default=str(DATA_DIR / "data.csv"), help="Path to full data CSV")
+    p_predict.add_argument("--model", type=str, required=True, help="Model name (e.g. lgbm)")
     p_predict.add_argument("--output-path", type=str, default=str(OUTPUTS_DIR / "predictions.csv"), help="Path to save predictions")
 
     # Explain
